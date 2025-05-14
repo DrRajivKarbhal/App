@@ -11,8 +11,8 @@ from datetime import datetime
 import time
 
 def main():
-    st.set_page_config(page_title="Protein Sequence Alignment Tool", layout="wide")
-    st.title("Protein Sequence Alignment Tool")
+    st.set_page_config(page_title="UniProt-PDB Residue mapping", layout="wide")
+    st.title("UniProt-PDB Residue mapping")
     
     # Initialize session state variables
     if 'current_uniprot_id' not in st.session_state:
