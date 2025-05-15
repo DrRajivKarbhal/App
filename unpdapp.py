@@ -11,42 +11,9 @@ from datetime import datetime
 if 'uniprot_data' not in st.session_state:
     st.session_state.uniprot_data = {}
 
-def main():
-    st.set_page_config(page_title="UniProt-PDB Residue mapping", layout="wide")
-    st.title("UniProt-PDB Residue mapping")
-    
-    # Input Section
-    with st.expander("Input Parameters", expanded=True):
-        new_uniprot_id = st.text_input("Enter UniProt ID(s), comma separated (e.g., P12345, Q98765)", 
-                                     value="Q05996",  # Pre-populate with example ID
-                                     key="uniprot_input")
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("Add UniProt ID(s)") and new_uniprot_id.strip():
-                add_uniprot_ids(new_uniprot_id)
-        with col2:
-            if st.button("Clear All IDs"):
-                st.session_state.uniprot_data = {}
-                st.rerun()
-    
-    # Display current UniProt IDs
-    if st.session_state.uniprot_data:
-        st.subheader("Current UniProt IDs to Process:")
-        cols = st.columns(4)
-        for i, uniprot_id in enumerate(st.session_state.uniprot_data.keys()):
-            with cols[i % 4]:
-                display_uniprot_card(uniprot_id)
-    
-    # Process button with better error handling
-    if st.session_state.uniprot_data:
-        if st.button("Process All UniProt IDs"):
-            with st.spinner("Processing all IDs..."):
-                process_all_uniprot_ids()
-                st.rerun()
-
-    # Display results for each UniProt ID
-    for uniprot_id in st.session_state.uniprot_data.keys():
-        display_results(uniprot_id)
+# --------------------------
+# Helper Functions (defined first)
+# --------------------------
 
 def add_uniprot_ids(new_uniprot_id):
     """Add new UniProt IDs to the processing list"""
@@ -153,7 +120,132 @@ def process_single_uniprot(uniprot_id):
     
     data['status'] = 'complete'
 
-# [Include all your original helper functions here]
+def display_results(uniprot_id):
+    """Display results for a single UniProt ID"""
+    data = st.session_state.uniprot_data[uniprot_id]
+    
+    st.divider()
+    st.subheader(f"Results for UniProt ID: {uniprot_id}")
+    
+    # Show status and error message if any
+    if data['status'] == 'error':
+        st.error(f"Processing failed: {data.get('error_message', 'Unknown error')}")
+    elif data['status'] == 'complete':
+        st.success("Processing complete")
+    elif data['status'] == 'processing':
+        st.warning("Processing in progress...")
+    
+    # PDB entries section
+    if data['pdb_entries']:
+        st.info(f"Found {len(data['pdb_entries'])} PDB entries")
+        
+        # Let user select a PDB to focus on
+        pdb_options = [f"{entry['id']} (Resolution: {entry['resolution']}, Length: {entry['length']})" 
+                      for entry in data['pdb_entries']]
+        selected_idx = st.selectbox(
+            f"Select PDB entry for {uniprot_id} to view details:",
+            range(len(pdb_options)),
+            format_func=lambda x: pdb_options[x],
+            key=f"pdb_select_{uniprot_id}"
+        )
+        
+        if selected_idx is not None:
+            selected_pdb = data['pdb_entries'][selected_idx]
+            data['selected_pdb'] = selected_pdb['id']
+            
+            # Show chains for selected PDB
+            if data['selected_pdb'] in data['chains']:
+                st.subheader(f"Chains in PDB {data['selected_pdb']}")
+                for chain_id, chain_data in data['chains'][data['selected_pdb']].items():
+                    seq_len = len(chain_data[0])
+                    st.write(f"**Chain {chain_id}** ({seq_len} aa): {data['chain_descriptions'].get(chain_id, 'No description')}")
+    
+    # Results section
+    if data['alignments'] or data['mappings']:
+        st.subheader("Alignment Results")
+        
+        tab1, tab2 = st.tabs(["Alignments", "Residue Mappings"])
+        
+        with tab1:
+            if data['alignments']:
+                st.text("\n".join(data['alignments']))
+            else:
+                st.warning("No alignment results available")
+            
+            if data['alignments']:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                st.download_button(
+                    label=f"Download Alignments for {uniprot_id}",
+                    data="\n".join(data['alignments']),
+                    file_name=f"alignments_{uniprot_id}_{timestamp}.txt",
+                    mime="text/plain",
+                    key=f"dl_align_{uniprot_id}"
+                )
+        
+        with tab2:
+            if data['mappings']:
+                st.text("\n".join(data['mappings']))
+            else:
+                st.warning("No residue mappings available")
+            
+            if data['mappings']:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                st.download_button(
+                    label=f"Download Mappings for {uniprot_id}",
+                    data="\n".join(data['mappings']),
+                    file_name=f"mappings_{uniprot_id}_{timestamp}.txt",
+                    mime="text/plain",
+                    key=f"dl_map_{uniprot_id}"
+                )
+
+# --------------------------
+# Main Application
+# --------------------------
+
+def main():
+    st.set_page_config(page_title="UniProt-PDB Residue mapping", layout="wide")
+    st.title("UniProt-PDB Residue mapping")
+    
+    # Input Section
+    with st.expander("Input Parameters", expanded=True):
+        new_uniprot_id = st.text_input("Enter UniProt ID(s), comma separated (e.g., P12345, Q98765)", 
+                                     key="uniprot_input")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Add UniProt ID(s)") and new_uniprot_id.strip():
+                add_uniprot_ids(new_uniprot_id)
+        with col2:
+            if st.button("Clear All IDs"):
+                st.session_state.uniprot_data = {}
+                st.rerun()
+    
+    # Display current UniProt IDs
+    if st.session_state.uniprot_data:
+        st.subheader("Current UniProt IDs to Process:")
+        cols = st.columns(4)
+        for i, uniprot_id in enumerate(st.session_state.uniprot_data.keys()):
+            with cols[i % 4]:
+                display_uniprot_card(uniprot_id)
+    
+    # Process button with better error handling
+    if st.session_state.uniprot_data:
+        if st.button("Process All UniProt IDs"):
+            with st.spinner("Processing all IDs..."):
+                process_all_uniprot_ids()
+                st.rerun()
+
+    # Display results for each UniProt ID
+    for uniprot_id in st.session_state.uniprot_data.keys():
+        display_results(uniprot_id)
+
+# --------------------------
+# Include all original helper functions:
+# _fetch_pdb_entries_task
+# _get_pdb_metadata
+# _fetch_chains_task
+# _fetch_uniprot_sequence_task
+# _perform_alignment
+# --------------------------
 
 if __name__ == "__main__":
     main()
