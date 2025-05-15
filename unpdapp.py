@@ -185,7 +185,7 @@ def main():
                     st.text("\n".join(result['mapping_results']))
                     
                     # Download button
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    timestamp = datetime.now().strftime("%Ym%d_%H%M%S")
                     default_name = f"mapping_{uniprot_id}_{result['selected_pdb']}_{timestamp}.txt"
                     st.download_button(
                         label=f"Save Mapping for {uniprot_id}",
@@ -195,10 +195,236 @@ def main():
                         key=f"dl_map_{uniprot_id}"
                     )
 
-# [Keep all the helper functions (_fetch_pdb_entries_task, _get_pdb_metadata, 
-#  _fetch_chains_task, _fetch_uniprot_sequence_task, _perform_alignment) 
-#  exactly the same as in the original script]
-# ... (rest of the helper functions remain unchanged)
+def _fetch_pdb_entries_task(uniprot_id):
+    url = f"https://rest.uniprot.org/uniprotkb/{uniprot_id}.json"
+    response = requests.get(url)
+    if response.status_code != 200:
+        raise Exception(f"Failed to fetch UniProt entry {uniprot_id}")
+        
+    data = response.json()
+    pdbs = []
+    for xref in data.get("uniProtKBCrossReferences", []):
+        if xref.get("database") == "PDB":
+            pdbs.append(xref.get("id"))
+            
+    pdb_entries = []
+    for pdb_id in sorted(pdbs):
+        meta = _get_pdb_metadata(pdb_id)
+        pdb_entries.append({
+            "id": pdb_id,
+            "title": meta.get("title", "N/A"),
+            "resolution": meta.get("resolution", "N/A"),
+            "length": meta.get("length", "N/A"),
+            "organisms": meta.get("organisms", "N/A")
+        })
+        
+    return pdb_entries
+    
+def _get_pdb_metadata(pdb_id):
+    url = f"https://data.rcsb.org/rest/v1/core/entry/{pdb_id}"
+    response = requests.get(url)
+    if response.status_code != 200:
+        return {}
+        
+    data = response.json()
+    title = data.get("struct", {}).get("title", "N/A")
+    resolution = data.get("rcsb_entry_info", {}).get("resolution_combined", ["N/A"])[0]
+    length = data.get("rcsb_entry_info", {}).get("deposited_polymer_monomer_count", "N/A")
+    organisms = []
+    
+    for entity in data.get("rcsb_entry_container_identifiers", {}).get("polymer_entity_ids", []):
+        entity_url = f"https://data.rcsb.org/rest/v1/core/polymer_entity/{pdb_id}/{entity}"
+        entity_resp = requests.get(entity_url)
+        if entity_resp.status_code == 200:
+            entity_data = entity_resp.json()
+            source = entity_data.get("rcsb_entity_source_organism", [{}])[0]
+            organism = source.get("scientific_name", "N/A")
+            if organism not in organisms:
+                organisms.append(organism)
+                
+    return {
+        "title": title,
+        "resolution": resolution,
+        "length": length,
+        "organisms": ", ".join(organisms)
+    }
+    
+def _fetch_chains_task(pdb_id):
+    try:
+        # Download PDB structure
+        url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
+        response = requests.get(url)
+        if response.status_code != 200:
+            raise Exception(f"Failed to download PDB {pdb_id}")
+        pdb_text = response.text
+
+        # Extract chain sequences and descriptions
+        chains_data = {}
+        chain_descriptions = {}
+        
+        # First parse the header for chain descriptions
+        current_compound = ""
+        for line in pdb_text.split('\n'):
+            if line.startswith('COMPND'):
+                current_compound += line[10:].strip() + " "
+                if ';' in line:
+                    # End of compound record
+                    if 'CHAIN:' in current_compound:
+                        parts = current_compound.split('CHAIN:')
+                        if len(parts) > 1:
+                            chains_part = parts[1].split(';')[0].strip()
+                            chains = [c.strip() for c in chains_part.split(',')]
+                            description = parts[0].strip()
+                            for chain in chains:
+                                chain_descriptions[chain] = description
+                    current_compound = ""
+        
+        # Then parse the structure for sequences
+        parser = PDBParser(QUIET=True)
+        structure = parser.get_structure("pdb", StringIO(pdb_text))
+        
+        standard_aa = {
+            'ALA', 'ARG', 'ASN', 'ASP', 'CYS', 'GLU', 'GLN', 'GLY',
+            'HIS', 'ILE', 'LEU', 'LYS', 'MET', 'PHE', 'PRO', 'SER',
+            'THR', 'TRP', 'TYR', 'VAL'
+        }
+
+        for model in structure:
+            for chain in model:
+                seq = ""
+                res_ids = []
+                for residue in chain:
+                    hetflag, resseq, icode = residue.get_id()
+                    if hetflag != " ":
+                        continue
+                    resname = residue.get_resname().strip()
+                    if resname not in standard_aa:
+                        continue
+                    try:
+                        aa = Polypeptide.three_to_one(resname)
+                    except Exception:
+                        continue
+                    seq += aa
+                    res_ids.append(resseq)
+                if seq:
+                    chains_data[chain.id] = (seq, res_ids)
+            break  # Only process first model
+
+        # If no chains found, try alternative approach from FASTA
+        if not chains_data:
+            fasta_url = f"https://www.rcsb.org/fasta/entry/{pdb_id}/display"
+            fasta_response = requests.get(fasta_url)
+            if fasta_response.status_code == 200:
+                for record in SeqIO.parse(StringIO(fasta_response.text), "fasta"):
+                    desc = record.description
+                    if "Chain" in desc:
+                        chain_id = desc.split("Chain")[1].split(",")[0].strip()
+                        chains_data[chain_id] = (str(record.seq), list(range(1, len(record.seq)+1)))
+                        chain_descriptions[chain_id] = desc
+
+        return chains_data, chain_descriptions
+
+    except Exception as e:
+        raise Exception(f"Error processing PDB chains: {str(e)}")
+        
+def _fetch_uniprot_sequence_task(uniprot_id):
+    try:
+        # Use the new UniProt REST API endpoint
+        url = f"https://rest.uniprot.org/uniprotkb/{uniprot_id}.fasta"
+        response = requests.get(url)
+        if response.status_code != 200:
+            raise Exception(f"Failed to fetch UniProt entry {uniprot_id}")
+        
+        # Parse the FASTA record
+        fasta = SeqIO.read(StringIO(response.text), "fasta")
+        return str(fasta.seq)
+    except Exception as e:
+        raise Exception(f"Error fetching UniProt sequence: {str(e)}")
+    
+def _perform_alignment(pdb_seq, pdb_res_ids, uni_seq):
+    try:
+        # Verify sequences
+        if not pdb_seq or not uni_seq:
+            return "Empty sequence encountered", "Cannot align empty sequences"
+        
+        # Initialize aligner with optimized parameters
+        aligner = PairwiseAligner()
+        aligner.mode = 'global'
+        aligner.open_gap_score = -10
+        aligner.extend_gap_score = -0.5
+        
+        # Use the correct substitution matrix syntax for your Biopython version
+        try:
+            # Try the new syntax first (Biopython 1.78+)
+            from Bio.Align import substitution_matrices
+            aligner.substitution_matrix = substitution_matrices.load("BLOSUM62")
+        except (ImportError, AttributeError):
+            # Fallback to older syntax
+            try:
+                aligner.substitution_matrix = PairwiseAligner.substitution_matrices.load("BLOSUM62")
+            except AttributeError:
+                # If neither works, use a simple match/mismatch scoring
+                aligner.match_score = 2
+                aligner.mismatch_score = -1
+        
+        # Perform alignment
+        alignments = aligner.align(pdb_seq, uni_seq)
+        
+        if not alignments:
+            return "No alignment could be generated", "No residue mapping available"
+        
+        alignment = alignments[0]  # Take the best alignment
+        
+        # Format alignment output
+        alignment_str = f"Alignment between PDB chain and UniProt {uniprot_id}\n"
+        alignment_str += f"Alignment score: {alignment.score:.2f}\n"
+        alignment_str += f"PDB sequence length: {len(pdb_seq)}\n"
+        alignment_str += f"UniProt sequence length: {len(uni_seq)}\n\n"
+        alignment_str += str(alignment)
+        
+        # Generate residue mapping
+        mapping_str = "PDB_ResID  UniProt_Pos  PDB_AA  UniProt_AA\n"
+        mapping_str += "-"*50 + "\n"
+        
+        # Get aligned sequences
+        aligned_pdb = alignment.aligned[0]
+        aligned_uni = alignment.aligned[1]
+        
+        pdb_pos = 0
+        uni_pos = 0
+        
+        for (p_start, p_end), (u_start, u_end) in zip(aligned_pdb, aligned_uni):
+            # Handle gaps before this alignment block
+            while pdb_pos < p_start:
+                mapping_str += f"{pdb_res_ids[pdb_pos]:<10}{'-':<12}{pdb_seq[pdb_pos]:<8}{'-':<8}\n"
+                pdb_pos += 1
+                
+            while uni_pos < u_start:
+                mapping_str += f"{'-':<10}{uni_pos+1:<12}{'-':<8}{uni_seq[uni_pos]:<8}\n"
+                uni_pos += 1
+                
+            # Handle aligned residues
+            while p_start < p_end and u_start < u_end:
+                mapping_str += f"{pdb_res_ids[pdb_pos]:<10}{uni_pos+1:<12}{pdb_seq[pdb_pos]:<8}{uni_seq[uni_pos]:<8}\n"
+                pdb_pos += 1
+                uni_pos += 1
+                p_start += 1
+                u_start += 1
+        
+        # Handle any remaining residues
+        while pdb_pos < len(pdb_seq):
+            mapping_str += f"{pdb_res_ids[pdb_pos]:<10}{'-':<12}{pdb_seq[pdb_pos]:<8}{'-':<8}\n"
+            pdb_pos += 1
+            
+        while uni_pos < len(uni_seq):
+            mapping_str += f"{'-':<10}{uni_pos+1:<12}{'-':<8}{uni_seq[uni_pos]:<8}\n"
+            uni_pos += 1
+            
+        return alignment_str, mapping_str
+        
+    except Exception as e:
+        error_msg = f"Alignment error: {str(e)}"
+        return error_msg, error_msg
 
 if __name__ == "__main__":
     main()
