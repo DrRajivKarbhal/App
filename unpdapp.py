@@ -7,6 +7,53 @@ from Bio.Data.IUPACData import protein_letters
 from io import StringIO
 from datetime import datetime
 
+# Define helper functions first
+def remove_uniprot_id(uniprot_id):
+    """Remove a UniProt ID from the processing list"""
+    st.session_state.uniprot_ids.remove(uniprot_id)
+    del st.session_state.processing_state[uniprot_id]
+
+def process_all_uniprot_ids():
+    """Process all UniProt IDs in sequence"""
+    for uniprot_id in st.session_state.uniprot_ids:
+        data = st.session_state.processing_state[uniprot_id]
+        data['status'] = 'processing'
+        
+        try:
+            # 1. Fetch PDB entries
+            if not data['pdb_entries']:
+                with st.spinner(f"Fetching PDB entries for {uniprot_id}..."):
+                    data['pdb_entries'] = _fetch_pdb_entries_task(uniprot_id)
+            
+            # 2. Fetch UniProt sequence
+            if not data['uniprot_seq']:
+                with st.spinner(f"Fetching sequence for {uniprot_id}..."):
+                    data['uniprot_seq'] = _fetch_uniprot_sequence_task(uniprot_id)
+            
+            # 3. Process each PDB entry
+            for pdb_entry in data['pdb_entries']:
+                pdb_id = pdb_entry['id']
+                if pdb_id not in data['chains']:
+                    with st.spinner(f"Processing {pdb_id} for {uniprot_id}..."):
+                        chains_data, chain_descriptions = _fetch_chains_task(pdb_id)
+                        data['chains'][pdb_id] = chains_data
+                        data['chain_descriptions'] = chain_descriptions
+                        
+                        # 4. Perform alignments for each chain
+                        if chains_data:
+                            for chain_id, (pdb_seq, pdb_res_ids) in chains_data.items():
+                                alignment, mapping = _perform_alignment(pdb_seq, pdb_res_ids, data['uniprot_seq'])
+                                data['alignments'].append(f"=== {pdb_id} Chain {chain_id} ===\n{alignment}\n")
+                                data['mappings'].append(f"=== {pdb_id} Chain {chain_id} ===\n{mapping}\n")
+            
+            data['status'] = 'complete'
+        
+        except Exception as e:
+            data['status'] = 'error'
+            st.error(f"Error processing {uniprot_id}: {str(e)}")
+        
+        st.rerun()
+
 def main():
     st.set_page_config(page_title="UniProt-PDB Residue mapping", layout="wide")
     st.title("UniProt-PDB Residue mapping")
@@ -40,7 +87,8 @@ def main():
                         'selected_chains': [],
                         'uniprot_seq': '',
                         'alignments': [],
-                        'mappings': []
+                        'mappings': [],
+                        'chain_descriptions': {}
                     }
             st.rerun()
         
@@ -55,6 +103,14 @@ def main():
         cols = st.columns(4)
         for i, uniprot_id in enumerate(st.session_state.uniprot_ids):
             with cols[i % 4]:
+                status = st.session_state.processing_state[uniprot_id]['status']
+                status_color = {
+                    'pending': 'gray',
+                    'processing': 'orange',
+                    'complete': 'green',
+                    'error': 'red'
+                }.get(status, 'gray')
+                
                 st.markdown(f"""
                 <div style="border: 1px solid #ccc; padding: 10px; border-radius: 5px; margin-bottom: 10px;">
                     <div style="display: flex; justify-content: space-between; align-items: center;">
@@ -62,8 +118,8 @@ def main():
                         <button style="background-color: #ff4b4b; color: white; border: none; border-radius: 3px; padding: 2px 5px;" 
                                 onclick="document.getElementById('remove_{uniprot_id}').click()">×</button>
                     </div>
-                    <div style="color: #666; font-size: 0.8em;">
-                        Status: {st.session_state.processing_state[uniprot_id]['status']}
+                    <div style="color: {status_color}; font-size: 0.8em;">
+                        Status: {status.capitalize()}
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -153,54 +209,8 @@ def main():
                         key=f"dl_map_{uniprot_id}"
                     )
 
-def remove_uniprot_id(uniprot_id):
-    """Remove a UniProt ID from the processing list"""
-    st.session_state.uniprot_ids.remove(uniprot_id)
-    del st.session_state.processing_state[uniprot_id]
-
-def process_all_uniprot_ids():
-    """Process all UniProt IDs in sequence"""
-    for uniprot_id in st.session_state.uniprot_ids:
-        data = st.session_state.processing_state[uniprot_id]
-        data['status'] = 'processing'
-        
-        try:
-            # 1. Fetch PDB entries
-            if not data['pdb_entries']:
-                with st.spinner(f"Fetching PDB entries for {uniprot_id}..."):
-                    data['pdb_entries'] = _fetch_pdb_entries_task(uniprot_id)
-            
-            # 2. Fetch UniProt sequence
-            if not data['uniprot_seq']:
-                with st.spinner(f"Fetching sequence for {uniprot_id}..."):
-                    data['uniprot_seq'] = _fetch_uniprot_sequence_task(uniprot_id)
-            
-            # 3. Process each PDB entry
-            for pdb_entry in data['pdb_entries']:
-                pdb_id = pdb_entry['id']
-                if pdb_id not in data['chains']:
-                    with st.spinner(f"Processing {pdb_id} for {uniprot_id}..."):
-                        chains_data, chain_descriptions = _fetch_chains_task(pdb_id)
-                        data['chains'][pdb_id] = chains_data
-                        data['chain_descriptions'] = chain_descriptions
-                        
-                        # 4. Perform alignments for each chain
-                        if chains_data:
-                            for chain_id, (pdb_seq, pdb_res_ids) in chains_data.items():
-                                alignment, mapping = _perform_alignment(pdb_seq, pdb_res_ids, data['uniprot_seq'])
-                                data['alignments'].append(f"=== {pdb_id} Chain {chain_id} ===\n{alignment}\n")
-                                data['mappings'].append(f"=== {pdb_id} Chain {chain_id} ===\n{mapping}\n")
-            
-            data['status'] = 'complete'
-        
-        except Exception as e:
-            data['status'] = 'error'
-            st.error(f"Error processing {uniprot_id}: {str(e)}")
-        
-        st.rerun()
-
-# ... [Keep all the helper functions (_fetch_pdb_entries_task, _get_pdb_metadata, 
-# _fetch_chains_task, _fetch_uniprot_sequence_task, _perform_alignment) the same as in the original script] ...
+# ... [Keep all the original helper functions (_fetch_pdb_entries_task, _get_pdb_metadata, 
+# _fetch_chains_task, _fetch_uniprot_sequence_task, _perform_alignment) the same] ...
 
 if __name__ == "__main__":
     main()
