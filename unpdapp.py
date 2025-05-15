@@ -70,56 +70,80 @@ def process_all_uniprot_ids():
                 st.error(f"Failed to process {uniprot_id}: {str(e)}")
 
 def process_single_uniprot(uniprot_id):
-    """Process a single UniProt ID with detailed error handling"""
+    """Process a single UniProt ID with detailed error handling and debugging"""
     data = st.session_state.uniprot_data[uniprot_id]
     
-    # 1. Fetch PDB entries
     try:
+        st.write(f"⏳ Starting processing for {uniprot_id}...")
+        
+        # 1. Fetch PDB entries with debugging
         if not data['pdb_entries']:
-            data['pdb_entries'] = _fetch_pdb_entries_task(uniprot_id)
-            if not data['pdb_entries']:
-                raise ValueError(f"No PDB entries found for {uniprot_id}")
-    except Exception as e:
-        raise Exception(f"Failed to fetch PDB entries: {str(e)}")
-    
-    # 2. Fetch UniProt sequence
-    try:
+            st.write(f"🔍 Fetching PDB entries for {uniprot_id}...")
+            try:
+                data['pdb_entries'] = _fetch_pdb_entries_task(uniprot_id)
+                st.write(f"✅ Found {len(data['pdb_entries'])} PDB entries")
+                if not data['pdb_entries']:
+                    raise ValueError(f"No PDB entries found for {uniprot_id}")
+            except Exception as e:
+                st.error(f"❌ PDB fetch failed: {str(e)}")
+                raise
+        
+        # 2. Fetch UniProt sequence with debugging
         if not data['uniprot_seq']:
-            data['uniprot_seq'] = _fetch_uniprot_sequence_task(uniprot_id)
-            if not data['uniprot_seq']:
-                raise ValueError(f"Empty sequence returned for {uniprot_id}")
-    except Exception as e:
-        raise Exception(f"Failed to fetch UniProt sequence: {str(e)}")
-    
-    # 3. Process each PDB entry
-    for pdb_entry in data['pdb_entries']:
-        pdb_id = pdb_entry['id']
-        try:
-            if pdb_id not in data['chains']:
-                chains_data, chain_descriptions = _fetch_chains_task(pdb_id)
-                if not chains_data:
-                    raise ValueError(f"No valid chains found in {pdb_id}")
-                
-                data['chains'][pdb_id] = chains_data
-                data['chain_descriptions'] = chain_descriptions
+            st.write(f"🔍 Fetching UniProt sequence for {uniprot_id}...")
+            try:
+                data['uniprot_seq'] = _fetch_uniprot_sequence_task(uniprot_id)
+                st.write(f"✅ Got sequence (length: {len(data['uniprot_seq'])})")
+                if not data['uniprot_seq']:
+                    raise ValueError(f"Empty sequence returned for {uniprot_id}")
+            except Exception as e:
+                st.error(f"❌ Sequence fetch failed: {str(e)}")
+                raise
+        
+        # 3. Process each PDB entry with debugging
+        for pdb_entry in data['pdb_entries']:
+            pdb_id = pdb_entry['id']
+            st.write(f"🔬 Processing PDB {pdb_id}...")
+            
+            try:
+                if pdb_id not in data['chains']:
+                    st.write(f"🔗 Fetching chains for {pdb_id}...")
+                    chains_data, chain_descriptions = _fetch_chains_task(pdb_id)
+                    
+                    if not chains_data:
+                        raise ValueError(f"No valid chains found in {pdb_id}")
+                    
+                    data['chains'][pdb_id] = chains_data
+                    data['chain_descriptions'] = chain_descriptions
+                    st.write(f"✅ Found {len(chains_data)} chains")
                 
                 # 4. Perform alignments for each chain
-                for chain_id, (pdb_seq, pdb_res_ids) in chains_data.items():
+                for chain_id, (pdb_seq, pdb_res_ids) in data['chains'][pdb_id].items():
+                    st.write(f"🔄 Aligning chain {chain_id} (length: {len(pdb_seq)})...")
                     try:
                         alignment, mapping = _perform_alignment(pdb_seq, pdb_res_ids, data['uniprot_seq'])
                         data['alignments'].append(f"=== {pdb_id} Chain {chain_id} ===\n{alignment}\n")
                         data['mappings'].append(f"=== {pdb_id} Chain {chain_id} ===\n{mapping}\n")
+                        st.write(f"✔️ Alignment successful for chain {chain_id}")
                     except Exception as e:
                         error_msg = f"Alignment failed for {pdb_id} chain {chain_id}: {str(e)}"
+                        st.error(f"❌ {error_msg}")
                         data['alignments'].append(error_msg)
                         data['mappings'].append(error_msg)
                         raise Exception(error_msg)
                         
-        except Exception as e:
-            raise Exception(f"Failed to process PDB {pdb_id}: {str(e)}")
+            except Exception as e:
+                st.error(f"❌ PDB processing failed: {str(e)}")
+                raise Exception(f"Failed to process PDB {pdb_id}: {str(e)}")
+        
+        data['status'] = 'complete'
+        st.success(f"🎉 Processing complete for {uniprot_id}")
     
-    data['status'] = 'complete'
-
+    except Exception as e:
+        data['status'] = 'error'
+        data['error_message'] = str(e)
+        st.error(f"🔥 Processing failed for {uniprot_id}: {str(e)}")
+        raise  # Re-raise to see full traceback in logs
 def display_results(uniprot_id):
     """Display results for a single UniProt ID"""
     data = st.session_state.uniprot_data[uniprot_id]
