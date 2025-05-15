@@ -1,275 +1,426 @@
 import streamlit as st
+import sys
 import requests
 from Bio import SeqIO
+from Bio.Seq import Seq
 from Bio.Align import PairwiseAligner
 from Bio.PDB import PDBParser, Polypeptide
 from Bio.Data.IUPACData import protein_letters
 from io import StringIO
 from datetime import datetime
-
-# Initialize session state
-if 'uniprot_data' not in st.session_state:
-    st.session_state.uniprot_data = {}
-
-# --------------------------
-# Helper Functions (defined first)
-# --------------------------
-
-def add_uniprot_ids(new_uniprot_id):
-    """Add new UniProt IDs to the processing list"""
-    ids_to_add = [id.strip().upper() for id in new_uniprot_id.split(',') if id.strip()]
-    for uniprot_id in ids_to_add:
-        if uniprot_id not in st.session_state.uniprot_data:
-            st.session_state.uniprot_data[uniprot_id] = {
-                'status': 'pending',
-                'error_message': '',
-                'pdb_entries': [],
-                'selected_pdb': None,
-                'chains': {},
-                'uniprot_seq': '',
-                'alignments': [],
-                'mappings': [],
-                'chain_descriptions': {}
-            }
-    st.rerun()
-
-def display_uniprot_card(uniprot_id):
-    """Display a card for a single UniProt ID with remove option"""
-    data = st.session_state.uniprot_data[uniprot_id]
-    status_color = {
-        'pending': 'gray',
-        'processing': 'orange',
-        'complete': 'green',
-        'error': 'red'
-    }.get(data['status'], 'gray')
-    
-    container = st.container()
-    container.markdown(f"""
-    <div style="border: 1px solid #ccc; padding: 10px; border-radius: 5px; margin-bottom: 10px;">
-        <div style="color: {status_color}; font-size: 0.8em;">
-            {uniprot_id} - {data['status'].capitalize()}
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    if container.button("Remove", key=f"remove_{uniprot_id}"):
-        del st.session_state.uniprot_data[uniprot_id]
-        st.rerun()
-
-def process_all_uniprot_ids():
-    """Process all UniProt IDs in sequence with error handling"""
-    for uniprot_id, data in st.session_state.uniprot_data.items():
-        if data['status'] in ['pending', 'error']:  # Retry failed ones
-            try:
-                data['status'] = 'processing'
-                data['error_message'] = ''
-                process_single_uniprot(uniprot_id)
-            except Exception as e:
-                data['status'] = 'error'
-                data['error_message'] = str(e)
-                st.error(f"Failed to process {uniprot_id}: {str(e)}")
-
-def process_single_uniprot(uniprot_id):
-    """Process a single UniProt ID with detailed error handling and debugging"""
-    data = st.session_state.uniprot_data[uniprot_id]
-    
-    try:
-        st.write(f"⏳ Starting processing for {uniprot_id}...")
-        
-        # 1. Fetch PDB entries with debugging
-        if not data['pdb_entries']:
-            st.write(f"🔍 Fetching PDB entries for {uniprot_id}...")
-            try:
-                data['pdb_entries'] = _fetch_pdb_entries_task(uniprot_id)
-                st.write(f"✅ Found {len(data['pdb_entries'])} PDB entries")
-                if not data['pdb_entries']:
-                    raise ValueError(f"No PDB entries found for {uniprot_id}")
-            except Exception as e:
-                st.error(f"❌ PDB fetch failed: {str(e)}")
-                raise
-        
-        # 2. Fetch UniProt sequence with debugging
-        if not data['uniprot_seq']:
-            st.write(f"🔍 Fetching UniProt sequence for {uniprot_id}...")
-            try:
-                data['uniprot_seq'] = _fetch_uniprot_sequence_task(uniprot_id)
-                st.write(f"✅ Got sequence (length: {len(data['uniprot_seq'])})")
-                if not data['uniprot_seq']:
-                    raise ValueError(f"Empty sequence returned for {uniprot_id}")
-            except Exception as e:
-                st.error(f"❌ Sequence fetch failed: {str(e)}")
-                raise
-        
-        # 3. Process each PDB entry with debugging
-        for pdb_entry in data['pdb_entries']:
-            pdb_id = pdb_entry['id']
-            st.write(f"🔬 Processing PDB {pdb_id}...")
-            
-            try:
-                if pdb_id not in data['chains']:
-                    st.write(f"🔗 Fetching chains for {pdb_id}...")
-                    chains_data, chain_descriptions = _fetch_chains_task(pdb_id)
-                    
-                    if not chains_data:
-                        raise ValueError(f"No valid chains found in {pdb_id}")
-                    
-                    data['chains'][pdb_id] = chains_data
-                    data['chain_descriptions'] = chain_descriptions
-                    st.write(f"✅ Found {len(chains_data)} chains")
-                
-                # 4. Perform alignments for each chain
-                for chain_id, (pdb_seq, pdb_res_ids) in data['chains'][pdb_id].items():
-                    st.write(f"🔄 Aligning chain {chain_id} (length: {len(pdb_seq)})...")
-                    try:
-                        alignment, mapping = _perform_alignment(pdb_seq, pdb_res_ids, data['uniprot_seq'])
-                        data['alignments'].append(f"=== {pdb_id} Chain {chain_id} ===\n{alignment}\n")
-                        data['mappings'].append(f"=== {pdb_id} Chain {chain_id} ===\n{mapping}\n")
-                        st.write(f"✔️ Alignment successful for chain {chain_id}")
-                    except Exception as e:
-                        error_msg = f"Alignment failed for {pdb_id} chain {chain_id}: {str(e)}"
-                        st.error(f"❌ {error_msg}")
-                        data['alignments'].append(error_msg)
-                        data['mappings'].append(error_msg)
-                        raise Exception(error_msg)
-                        
-            except Exception as e:
-                st.error(f"❌ PDB processing failed: {str(e)}")
-                raise Exception(f"Failed to process PDB {pdb_id}: {str(e)}")
-        
-        data['status'] = 'complete'
-        st.success(f"🎉 Processing complete for {uniprot_id}")
-    
-    except Exception as e:
-        data['status'] = 'error'
-        data['error_message'] = str(e)
-        st.error(f"🔥 Processing failed for {uniprot_id}: {str(e)}")
-        raise  # Re-raise to see full traceback in logs
-def display_results(uniprot_id):
-    """Display results for a single UniProt ID"""
-    data = st.session_state.uniprot_data[uniprot_id]
-    
-    st.divider()
-    st.subheader(f"Results for UniProt ID: {uniprot_id}")
-    
-    # Show status and error message if any
-    if data['status'] == 'error':
-        st.error(f"Processing failed: {data.get('error_message', 'Unknown error')}")
-    elif data['status'] == 'complete':
-        st.success("Processing complete")
-    elif data['status'] == 'processing':
-        st.warning("Processing in progress...")
-    
-    # PDB entries section
-    if data['pdb_entries']:
-        st.info(f"Found {len(data['pdb_entries'])} PDB entries")
-        
-        # Let user select a PDB to focus on
-        pdb_options = [f"{entry['id']} (Resolution: {entry['resolution']}, Length: {entry['length']})" 
-                      for entry in data['pdb_entries']]
-        selected_idx = st.selectbox(
-            f"Select PDB entry for {uniprot_id} to view details:",
-            range(len(pdb_options)),
-            format_func=lambda x: pdb_options[x],
-            key=f"pdb_select_{uniprot_id}"
-        )
-        
-        if selected_idx is not None:
-            selected_pdb = data['pdb_entries'][selected_idx]
-            data['selected_pdb'] = selected_pdb['id']
-            
-            # Show chains for selected PDB
-            if data['selected_pdb'] in data['chains']:
-                st.subheader(f"Chains in PDB {data['selected_pdb']}")
-                for chain_id, chain_data in data['chains'][data['selected_pdb']].items():
-                    seq_len = len(chain_data[0])
-                    st.write(f"**Chain {chain_id}** ({seq_len} aa): {data['chain_descriptions'].get(chain_id, 'No description')}")
-    
-    # Results section
-    if data['alignments'] or data['mappings']:
-        st.subheader("Alignment Results")
-        
-        tab1, tab2 = st.tabs(["Alignments", "Residue Mappings"])
-        
-        with tab1:
-            if data['alignments']:
-                st.text("\n".join(data['alignments']))
-            else:
-                st.warning("No alignment results available")
-            
-            if data['alignments']:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                st.download_button(
-                    label=f"Download Alignments for {uniprot_id}",
-                    data="\n".join(data['alignments']),
-                    file_name=f"alignments_{uniprot_id}_{timestamp}.txt",
-                    mime="text/plain",
-                    key=f"dl_align_{uniprot_id}"
-                )
-        
-        with tab2:
-            if data['mappings']:
-                st.text("\n".join(data['mappings']))
-            else:
-                st.warning("No residue mappings available")
-            
-            if data['mappings']:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                st.download_button(
-                    label=f"Download Mappings for {uniprot_id}",
-                    data="\n".join(data['mappings']),
-                    file_name=f"mappings_{uniprot_id}_{timestamp}.txt",
-                    mime="text/plain",
-                    key=f"dl_map_{uniprot_id}"
-                )
-
-# --------------------------
-# Main Application
-# --------------------------
+import time
 
 def main():
     st.set_page_config(page_title="UniProt-PDB Residue mapping", layout="wide")
     st.title("UniProt-PDB Residue mapping")
     
+    # Initialize session state variables
+    if 'current_uniprot_id' not in st.session_state:
+        st.session_state.current_uniprot_id = ""
+    if 'current_pdb_id' not in st.session_state:
+        st.session_state.current_pdb_id = ""
+    if 'current_chain_ids' not in st.session_state:
+        st.session_state.current_chain_ids = []
+    if 'pdb_entries' not in st.session_state:
+        st.session_state.pdb_entries = []
+    if 'chain_data' not in st.session_state:
+        st.session_state.chain_data = {}
+    if 'uni_seq' not in st.session_state:
+        st.session_state.uni_seq = ""
+    if 'current_page' not in st.session_state:
+        st.session_state.current_page = 1
+    if 'entries_per_page' not in st.session_state:
+        st.session_state.entries_per_page = 10
+    if 'selected_chains' not in st.session_state:
+        st.session_state.selected_chains = []
+    if 'alignment_results' not in st.session_state:
+        st.session_state.alignment_results = []
+    if 'mapping_results' not in st.session_state:
+        st.session_state.mapping_results = []
+    
     # Input Section
     with st.expander("Input Parameters", expanded=True):
-        new_uniprot_id = st.text_input("Enter UniProt ID(s), comma separated (e.g., P12345, Q98765)", 
-                                     key="uniprot_input")
-        col1, col2 = st.columns(2)
+        uniprot_id = st.text_input("UniProt ID (e.g., P12345)", key="uniprot_input")
+        fetch_pdb_btn = st.button("Fetch PDB Entries")
+        
+        if fetch_pdb_btn:
+            if not uniprot_id.strip():
+                st.error("Please enter a UniProt ID")
+            else:
+                st.session_state.current_uniprot_id = uniprot_id.strip()
+                with st.spinner("Fetching PDB entries..."):
+                    try:
+                        pdb_entries = _fetch_pdb_entries_task(st.session_state.current_uniprot_id)
+                        st.session_state.pdb_entries = pdb_entries
+                        st.session_state.current_page = 1
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to fetch PDB entries: {str(e)}")
+    
+    # PDB Count Label
+    if st.session_state.pdb_entries:
+        st.info(f"Total PDB Structures: {len(st.session_state.pdb_entries)}")
+    
+    # PDB Table Section
+    if st.session_state.pdb_entries:
+        st.subheader("Available PDB Entries:")
+        
+        # Pagination
+        total_pages = len(st.session_state.pdb_entries) // st.session_state.entries_per_page + (1 if len(st.session_state.pdb_entries) % st.session_state.entries_per_page else 0)
+        total_pages = max(1, total_pages)
+        
+        col1, col2, col3 = st.columns([1, 2, 1])
         with col1:
-            if st.button("Add UniProt ID(s)") and new_uniprot_id.strip():
-                add_uniprot_ids(new_uniprot_id)
+            if st.session_state.current_page > 1:
+                if st.button("Previous"):
+                    st.session_state.current_page -= 1
+                    st.rerun()
         with col2:
-            if st.button("Clear All IDs"):
-                st.session_state.uniprot_data = {}
-                st.rerun()
+            st.write(f"Page {st.session_state.current_page} of {total_pages}")
+        with col3:
+            if st.session_state.current_page < total_pages:
+                if st.button("Next"):
+                    st.session_state.current_page += 1
+                    st.rerun()
+        
+        # Display current page entries
+        start_idx = (st.session_state.current_page - 1) * st.session_state.entries_per_page
+        end_idx = start_idx + st.session_state.entries_per_page
+        page_entries = st.session_state.pdb_entries[start_idx:end_idx]
+        
+        # Create a radio button selection for PDB entries
+        pdb_options = [f"{entry['id']} (Resolution: {entry['resolution']}, Length: {entry['length']})" for entry in page_entries]
+        selected_pdb = st.radio("Select a PDB entry:", pdb_options, index=None)
+        
+        if selected_pdb:
+            selected_pdb_id = selected_pdb.split()[0]
+            st.session_state.current_pdb_id = selected_pdb_id
+            if st.button("Fetch Chains"):
+                with st.spinner(f"Fetching chains for {selected_pdb_id}..."):
+                    try:
+                        chains_data, chain_descriptions = _fetch_chains_task(selected_pdb_id)
+                        st.session_state.chain_data = chains_data
+                        st.session_state.chain_descriptions = chain_descriptions
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to fetch chains: {str(e)}")
     
-    # Display current UniProt IDs
-    if st.session_state.uniprot_data:
-        st.subheader("Current UniProt IDs to Process:")
-        cols = st.columns(4)
-        for i, uniprot_id in enumerate(st.session_state.uniprot_data.keys()):
-            with cols[i % 4]:
-                display_uniprot_card(uniprot_id)
+    # Chains Section
+    if st.session_state.chain_data:
+        st.subheader("Available Chains")
+        
+        # Display chain checkboxes
+        st.session_state.selected_chains = []
+        for chain_id in sorted(st.session_state.chain_data.keys()):
+            seq_length = len(st.session_state.chain_data[chain_id][0])
+            desc = st.session_state.chain_descriptions.get(chain_id, "No description available")
+            if st.checkbox(f"Chain {chain_id} ({seq_length} aa): {desc}", key=f"chain_{chain_id}", value=True):
+                st.session_state.selected_chains.append(chain_id)
+        
+        if st.button("Process Selected Chains"):
+            if not st.session_state.selected_chains:
+                st.warning("Please select at least one chain")
+            else:
+                st.session_state.current_chain_ids = st.session_state.selected_chains
+                
+                # First fetch UniProt sequence if not already done
+                if not st.session_state.uni_seq:
+                    with st.spinner("Fetching UniProt sequence..."):
+                        try:
+                            uni_seq = _fetch_uniprot_sequence_task(st.session_state.current_uniprot_id)
+                            st.session_state.uni_seq = uni_seq
+                        except Exception as e:
+                            st.error(f"Failed to fetch UniProt sequence: {str(e)}")
+                            return
+                
+                # Process chains
+                with st.spinner("Processing chains..."):
+                    progress_bar = st.progress(0)
+                    alignment_results = []
+                    mapping_results = []
+                    
+                    for i, chain_id in enumerate(st.session_state.current_chain_ids):
+                        progress_bar.progress((i + 1) / len(st.session_state.current_chain_ids))
+                        if chain_id in st.session_state.chain_data:
+                            pdb_seq, pdb_res_ids = st.session_state.chain_data[chain_id]
+                            
+                            # Validate PDB sequence
+                            if not pdb_seq or not all(aa.upper() in protein_letters for aa in pdb_seq):
+                                alignment_results.append(f"=== Chain {chain_id} ===\nInvalid PDB sequence (contains non-standard amino acids)\n")
+                                mapping_results.append(f"=== Chain {chain_id} ===\nInvalid PDB sequence (contains non-standard amino acids)\n")
+                                continue
+                            
+                            alignment, mapping = _perform_alignment(pdb_seq, pdb_res_ids, st.session_state.uni_seq)
+                            alignment_results.append(f"=== Chain {chain_id} ===\n{alignment}\n")
+                            mapping_results.append(f"=== Chain {chain_id} ===\n{mapping}\n")
+                    
+                    st.session_state.alignment_results = alignment_results
+                    st.session_state.mapping_results = mapping_results
+                    progress_bar.empty()
+                    st.rerun()
     
-    # Process button with better error handling
-    if st.session_state.uniprot_data:
-        if st.button("Process All UniProt IDs"):
-            with st.spinner("Processing all IDs..."):
-                process_all_uniprot_ids()
-                st.rerun()
+    # Results Section
+    if st.session_state.alignment_results or st.session_state.mapping_results:
+        st.subheader("Results")
+        
+        tab1, tab2 = st.tabs(["Alignment", "Residue Mapping"])
+        
+        with tab1:
+            st.text("\n".join(st.session_state.alignment_results))
+            
+            # Download button
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            default_name = f"alignment_{st.session_state.current_uniprot_id}_{st.session_state.current_pdb_id}_{timestamp}.txt"
+            st.download_button(
+                label="Save Alignment",
+                data="\n".join(st.session_state.alignment_results),
+                file_name=default_name,
+                mime="text/plain"
+            )
+        
+        with tab2:
+            st.text("\n".join(st.session_state.mapping_results))
+            
+            # Download button
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            default_name = f"mapping_{st.session_state.current_uniprot_id}_{st.session_state.current_pdb_id}_{timestamp}.txt"
+            st.download_button(
+                label="Save Mapping",
+                data="\n".join(st.session_state.mapping_results),
+                file_name=default_name,
+                mime="text/plain"
+            )
 
-    # Display results for each UniProt ID
-    for uniprot_id in st.session_state.uniprot_data.keys():
-        display_results(uniprot_id)
+def _fetch_pdb_entries_task(uniprot_id):
+    url = f"https://rest.uniprot.org/uniprotkb/{uniprot_id}.json"
+    response = requests.get(url)
+    if response.status_code != 200:
+        raise Exception(f"Failed to fetch UniProt entry {uniprot_id}")
+        
+    data = response.json()
+    pdbs = []
+    for xref in data.get("uniProtKBCrossReferences", []):
+        if xref.get("database") == "PDB":
+            pdbs.append(xref.get("id"))
+            
+    pdb_entries = []
+    for pdb_id in sorted(pdbs):
+        meta = _get_pdb_metadata(pdb_id)
+        pdb_entries.append({
+            "id": pdb_id,
+            "title": meta.get("title", "N/A"),
+            "resolution": meta.get("resolution", "N/A"),
+            "length": meta.get("length", "N/A"),
+            "organisms": meta.get("organisms", "N/A")
+        })
+        
+    return pdb_entries
+    
+def _get_pdb_metadata(pdb_id):
+    url = f"https://data.rcsb.org/rest/v1/core/entry/{pdb_id}"
+    response = requests.get(url)
+    if response.status_code != 200:
+        return {}
+        
+    data = response.json()
+    title = data.get("struct", {}).get("title", "N/A")
+    resolution = data.get("rcsb_entry_info", {}).get("resolution_combined", ["N/A"])[0]
+    length = data.get("rcsb_entry_info", {}).get("deposited_polymer_monomer_count", "N/A")
+    organisms = []
+    
+    for entity in data.get("rcsb_entry_container_identifiers", {}).get("polymer_entity_ids", []):
+        entity_url = f"https://data.rcsb.org/rest/v1/core/polymer_entity/{pdb_id}/{entity}"
+        entity_resp = requests.get(entity_url)
+        if entity_resp.status_code == 200:
+            entity_data = entity_resp.json()
+            source = entity_data.get("rcsb_entity_source_organism", [{}])[0]
+            organism = source.get("scientific_name", "N/A")
+            if organism not in organisms:
+                organisms.append(organism)
+                
+    return {
+        "title": title,
+        "resolution": resolution,
+        "length": length,
+        "organisms": ", ".join(organisms)
+    }
+    
+def _fetch_chains_task(pdb_id):
+    try:
+        # Download PDB structure
+        url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
+        response = requests.get(url)
+        if response.status_code != 200:
+            raise Exception(f"Failed to download PDB {pdb_id}")
+        pdb_text = response.text
 
-# --------------------------
-# Include all original helper functions:
-# _fetch_pdb_entries_task
-# _get_pdb_metadata
-# _fetch_chains_task
-# _fetch_uniprot_sequence_task
-# _perform_alignment
-# --------------------------
+        # Extract chain sequences and descriptions
+        chains_data = {}
+        chain_descriptions = {}
+        
+        # First parse the header for chain descriptions
+        current_compound = ""
+        for line in pdb_text.split('\n'):
+            if line.startswith('COMPND'):
+                current_compound += line[10:].strip() + " "
+                if ';' in line:
+                    # End of compound record
+                    if 'CHAIN:' in current_compound:
+                        parts = current_compound.split('CHAIN:')
+                        if len(parts) > 1:
+                            chains_part = parts[1].split(';')[0].strip()
+                            chains = [c.strip() for c in chains_part.split(',')]
+                            description = parts[0].strip()
+                            for chain in chains:
+                                chain_descriptions[chain] = description
+                    current_compound = ""
+        
+        # Then parse the structure for sequences
+        parser = PDBParser(QUIET=True)
+        structure = parser.get_structure("pdb", StringIO(pdb_text))
+        
+        standard_aa = {
+            'ALA', 'ARG', 'ASN', 'ASP', 'CYS', 'GLU', 'GLN', 'GLY',
+            'HIS', 'ILE', 'LEU', 'LYS', 'MET', 'PHE', 'PRO', 'SER',
+            'THR', 'TRP', 'TYR', 'VAL'
+        }
+
+        for model in structure:
+            for chain in model:
+                seq = ""
+                res_ids = []
+                for residue in chain:
+                    hetflag, resseq, icode = residue.get_id()
+                    if hetflag != " ":
+                        continue
+                    resname = residue.get_resname().strip()
+                    if resname not in standard_aa:
+                        continue
+                    try:
+                        aa = Polypeptide.three_to_one(resname)
+                    except Exception:
+                        continue
+                    seq += aa
+                    res_ids.append(resseq)
+                if seq:
+                    chains_data[chain.id] = (seq, res_ids)
+            break  # Only process first model
+
+        # If no chains found, try alternative approach from FASTA
+        if not chains_data:
+            fasta_url = f"https://www.rcsb.org/fasta/entry/{pdb_id}/display"
+            fasta_response = requests.get(fasta_url)
+            if fasta_response.status_code == 200:
+                for record in SeqIO.parse(StringIO(fasta_response.text), "fasta"):
+                    desc = record.description
+                    if "Chain" in desc:
+                        chain_id = desc.split("Chain")[1].split(",")[0].strip()
+                        chains_data[chain_id] = (str(record.seq), list(range(1, len(record.seq)+1)))
+                        chain_descriptions[chain_id] = desc
+
+        return chains_data, chain_descriptions
+
+    except Exception as e:
+        raise Exception(f"Error processing PDB chains: {str(e)}")
+        
+def _fetch_uniprot_sequence_task(uniprot_id):
+    try:
+        # Use the new UniProt REST API endpoint
+        url = f"https://rest.uniprot.org/uniprotkb/{uniprot_id}.fasta"
+        response = requests.get(url)
+        if response.status_code != 200:
+            raise Exception(f"Failed to fetch UniProt entry {uniprot_id}")
+        
+        # Parse the FASTA record
+        fasta = SeqIO.read(StringIO(response.text), "fasta")
+        return str(fasta.seq)
+    except Exception as e:
+        raise Exception(f"Error fetching UniProt sequence: {str(e)}")
+    
+def _perform_alignment(pdb_seq, pdb_res_ids, uni_seq):
+    try:
+        # Verify sequences
+        if not pdb_seq or not uni_seq:
+            return "Empty sequence encountered", "Cannot align empty sequences"
+        
+        # Initialize aligner with optimized parameters
+        aligner = PairwiseAligner()
+        aligner.mode = 'global'
+        aligner.open_gap_score = -10
+        aligner.extend_gap_score = -0.5
+        
+        # Use the correct substitution matrix syntax for your Biopython version
+        try:
+            # Try the new syntax first (Biopython 1.78+)
+            from Bio.Align import substitution_matrices
+            aligner.substitution_matrix = substitution_matrices.load("BLOSUM62")
+        except (ImportError, AttributeError):
+            # Fallback to older syntax
+            try:
+                aligner.substitution_matrix = PairwiseAligner.substitution_matrices.load("BLOSUM62")
+            except AttributeError:
+                # If neither works, use a simple match/mismatch scoring
+                aligner.match_score = 2
+                aligner.mismatch_score = -1
+        
+        # Perform alignment
+        alignments = aligner.align(pdb_seq, uni_seq)
+        
+        if not alignments:
+            return "No alignment could be generated", "No residue mapping available"
+        
+        alignment = alignments[0]  # Take the best alignment
+        
+        # Format alignment output
+        alignment_str = f"Alignment between PDB chain and UniProt {st.session_state.current_uniprot_id}\n"
+        alignment_str += f"Alignment score: {alignment.score:.2f}\n"
+        alignment_str += f"PDB sequence length: {len(pdb_seq)}\n"
+        alignment_str += f"UniProt sequence length: {len(uni_seq)}\n\n"
+        alignment_str += str(alignment)
+        
+        # Generate residue mapping
+        mapping_str = "PDB_ResID  UniProt_Pos  PDB_AA  UniProt_AA\n"
+        mapping_str += "-"*50 + "\n"
+        
+        # Get aligned sequences
+        aligned_pdb = alignment.aligned[0]
+        aligned_uni = alignment.aligned[1]
+        
+        pdb_pos = 0
+        uni_pos = 0
+        
+        for (p_start, p_end), (u_start, u_end) in zip(aligned_pdb, aligned_uni):
+            # Handle gaps before this alignment block
+            while pdb_pos < p_start:
+                mapping_str += f"{pdb_res_ids[pdb_pos]:<10}{'-':<12}{pdb_seq[pdb_pos]:<8}{'-':<8}\n"
+                pdb_pos += 1
+                
+            while uni_pos < u_start:
+                mapping_str += f"{'-':<10}{uni_pos+1:<12}{'-':<8}{uni_seq[uni_pos]:<8}\n"
+                uni_pos += 1
+                
+            # Handle aligned residues
+            while p_start < p_end and u_start < u_end:
+                mapping_str += f"{pdb_res_ids[pdb_pos]:<10}{uni_pos+1:<12}{pdb_seq[pdb_pos]:<8}{uni_seq[uni_pos]:<8}\n"
+                pdb_pos += 1
+                uni_pos += 1
+                p_start += 1
+                u_start += 1
+        
+        # Handle any remaining residues
+        while pdb_pos < len(pdb_seq):
+            mapping_str += f"{pdb_res_ids[pdb_pos]:<10}{'-':<12}{pdb_seq[pdb_pos]:<8}{'-':<8}\n"
+            pdb_pos += 1
+            
+        while uni_pos < len(uni_seq):
+            mapping_str += f"{'-':<10}{uni_pos+1:<12}{'-':<8}{uni_seq[uni_pos]:<8}\n"
+            uni_pos += 1
+            
+        return alignment_str, mapping_str
+        
+    except Exception as e:
+        error_msg = f"Alignment error: {str(e)}"
+        return error_msg, error_msg
 
 if __name__ == "__main__":
     main()
