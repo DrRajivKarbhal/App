@@ -57,23 +57,18 @@ def main():
         cols = st.columns(4)
         for i, uniprot_id in enumerate(st.session_state.uniprot_ids):
             with cols[i % 4]:
-                st.markdown(f"""
-                <div style="border: 1px solid #ccc; padding: 10px; border-radius: 5px; margin-bottom: 10px;">
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <span>{uniprot_id}</span>
-                        <button style="background-color: #ff4b4b; color: white; border: none; border-radius: 3px; padding: 2px 5px;" 
-                                onclick="document.getElementById('remove_{uniprot_id}').click()">×</button>
-                    </div>
+                container = st.container(border=True)
+                container.markdown(f"""
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <span>{uniprot_id}</span>
                     <div style="color: #666; font-size: 0.8em;">
                         Status: {st.session_state.processing_state[uniprot_id]['status']}
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
-                st.button("Remove", 
-                         key=f"remove_{uniprot_id}", 
-                         on_click=partial(remove_uniprot_id, uniprot_id),
-                         label_visibility="hidden", 
-                         id=f"remove_{uniprot_id}")
+                
+                if container.button("Remove", key=f"remove_{uniprot_id}"):
+                    remove_uniprot_id(uniprot_id)
     
     # Process button
     if st.session_state.uniprot_ids:
@@ -173,19 +168,19 @@ def process_all_uniprot_ids():
         try:
             # 1. Fetch PDB entries
             if not data['pdb_entries']:
-                with st.spinner(f"Fetching PDB entries for {uniprot_id}..."):  # Fixed variable name here
+                with st.spinner(f"Fetching PDB entries for {uniprot_id}..."):
                     data['pdb_entries'] = _fetch_pdb_entries_task(uniprot_id)
             
             # 2. Fetch UniProt sequence
             if not data['uniprot_seq']:
-                with st.spinner(f"Fetching sequence for {uniprot_id}..."):  # Fixed variable name here
+                with st.spinner(f"Fetching sequence for {uniprot_id}..."):
                     data['uniprot_seq'] = _fetch_uniprot_sequence_task(uniprot_id)
             
             # 3. Process each PDB entry
             for pdb_entry in data['pdb_entries']:
                 pdb_id = pdb_entry['id']
                 if pdb_id not in data['chains']:
-                    with st.spinner(f"Processing {pdb_id} for {uniprot_id}..."):  # Fixed variable name here
+                    with st.spinner(f"Processing {pdb_id} for {uniprot_id}..."):
                         chains_data, chain_descriptions = _fetch_chains_task(pdb_id)
                         data['chains'][pdb_id] = chains_data
                         data['chain_descriptions'] = chain_descriptions
@@ -201,7 +196,7 @@ def process_all_uniprot_ids():
         
         except Exception as e:
             data['status'] = 'error'
-            st.error(f"Error processing {uniprot_id}: {str(e)}")  # Fixed variable name here
+            st.error(f"Error processing {uniprot_id}: {str(e)}")
         
         st.rerun()
 
